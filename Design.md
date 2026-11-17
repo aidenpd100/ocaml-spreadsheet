@@ -19,7 +19,8 @@ The interesting parts of the project are:
 1. **Sparse storage.** The sheet is a persistent map from coordinates to cells,
    not a 2D array. Only cells that contain something are stored, so the sheet is
    effectively unbounded and memory use depends on how many cells are filled,
-   not on the grid size.
+   not on the grid size. Every edit produces a new sheet that shares almost all 
+   of its structure with the old one, which makes undo/redo cheap.
 2. **A formula language.** A lexer and recursive-descent parser turn formula
    strings into an AST, which a pure evaluator computes.
 3. **A dependency graph.** When a cell changes, we work out exactly which cells
@@ -66,6 +67,7 @@ UI just shows a fixed window to start.)
 | Tab (while editing) | Commit the edit, then move selection right one column. |
 | Esc (while editing) | Cancel the edit; the cell is unchanged. |
 | Delete / Backspace (not editing) | Clear the cell. |
+| Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z | Undo / redo (§2.10). |
 
 Every commit sends one request to the server. The server replies with **every
 cell whose value changed**, and the UI updates exactly those cells.
@@ -207,6 +209,27 @@ GET /api/cells?from=A1&to=Z100
 The sheet lives in server memory for the session. (Saving to a file is a
 possible extension; see §8.)
 
+### 2.10 Undo and redo
+ 
+Continuing from §2.8, the user presses Ctrl+Z. B2 comes back as `3` and B5 goes
+back to `10`. Pressing Ctrl+Shift+Z clears B2 again.
+ 
+```
+POST /api/undo
+ 
+200 OK
+{"changed": [
+  {"coord": "B2", "raw": "3",           "display": "3",  "kind": "number"},
+  {"coord": "B5", "raw": "=SUM(B1:B4)", "display": "10", "kind": "number"}
+]}
+```
+ 
+Undo does not replay an inverse edit. The server keeps the previous sheets
+themselves and switches back to one. Because sheets are persistent maps, each
+stored version costs only the cells that changed. Making a new edit after
+undoing clears the redo history, as in any editor. Undo with nothing to undo
+returns `{"changed": []}`.
+
 ---
 
 ## 3. Architecture
@@ -214,14 +237,14 @@ possible extension; see §8.)
 ```
 ┌──────────────┐   JSON over HTTP   ┌─────────────────────────────────────────┐
 │ React (Vite) │ ─────────────────► │ server/  (Dream)                        │
-│  grid,       │ ◄───────────────── │   holds one `Sheet.t ref`               │
+│  grid,       │ ◄───────────────── │   holds one `Sheet.t History.t ref`     │
 │  formula bar │                    │   decodes requests, encodes responses   │
 └──────────────┘                    └──────────────────┬──────────────────────┘
                                                        │ calls (pure)
-                                    ┌──────────────────▼──────────────────────┐
-                                    │ src/sheet  (spreadsheet library)        │
-                                    │   Coord · Formula · Eval · Sheet · Json │
-                                    └──────────────────┬──────────────────────┘
+                                    ┌──────────────────▼────────────────────────────────┐
+                                    │ src/camlsheet  (spreadsheet library)              │
+                                    │   Coord · Formula · Eval · Sheet · History · Json │
+                                    └──────────────────┬────────────────────────────────┘
                                                        │ instantiates
                                     ┌──────────────────▼──────────────────────┐
                                     │ src/depgraph  (general library)         │
@@ -230,8 +253,9 @@ possible extension; see §8.)
                                     └─────────────────────────────────────────┘
 ```
 
-**Rule:** everything under `src/` is pure — no IO, no mutation. The only
-mutable state in the project is the single `Sheet.t ref` in the server.
+**Rule:** everything under `src/` is pure — no IO, no mutation. The only 
+mutable state in the project is the single Sheet.t History.t ref in the 
+server (the current sheet plus its undo history).
 
 ### Repository layout
 
@@ -239,21 +263,24 @@ mutable state in the project is the single `Sheet.t ref` in the server.
 Design.md
 dune-project            (with opam package stanza; generates camlsheet.opam)
 src/
-  depgraph/             dune library `depgraph`  — the general library
+  depgraph/             dune library `depgraph`   — the general library
     depgraph.mli
-  sheet/                dune library `sheet`     — depends on depgraph
+  camlsheet/            dune library `camlsheet`  — depends on depgraph
     coord.mli
     formula.mli
     eval.mli
     sheet.mli
+    history.mli
     json.mli
-server/                 dune executable          — depends on sheet, dream
+server/                 dune executable           — depends on camlsheet, dream
   main.ml
 test/                   OUnit2 + QCheck tests, one file per module
 demo/                   one working demo per non-standard library
   dream/  yojson/  qcheck/  bisect_ppx/
 frontend/               React + Vite (not counted as project code)
 ```
+
+(The library is named camlsheet rather than sheet because dune does not allow a library to contain a module with the library’s own name.)
 
 ---
 
@@ -300,6 +327,7 @@ type content =
 val classify : string -> content option   (* None for empty input *)
 val parse    : string -> (expr, string) result   (* input without the leading '=' *)
 val refs     : expr -> Coord.t list   (* every cell this formula reads, ranges expanded *)
+val content_refs : content -> Coord.t list   (* refs of a formula; [] for anything else *)
 val to_string : expr -> string        (* AST back to formula text *)
 ```
 
@@ -485,6 +513,8 @@ val raw_of_json    : Yojson.Safe.t -> (string, string) result   (* {"raw": "..."
 | GET | `/api/cells?from=A1&to=Z100` | — | `{"cells": [...]}` all non-empty cells in the rectangle |
 | GET | `/api/cells/:coord` | — | One cell, or 404 if empty |
 | PUT | `/api/cells/:coord` | `{"raw": "..."}` | `{"changed": [...]}`; `"raw": ""` clears the cell |
+| POST | `/api/undo` | — | `{"changed": [...]}`; empty list if there is nothing to undo |
+| POST | `/api/redo` | — | `{"changed": [...]}`; empty list if there is nothing to redo |
 
 Bad coordinates or bad JSON → 400 with `{"error": "..."}`.
 
@@ -546,7 +576,7 @@ Each demo has been built and run on all three team members' machines.
 |---|---|
 | Max — Formulas | `Formula` (lexer, parser, `refs`, `to_string`), `Eval` (values, functions) |
 | Aiden — Engine | `Depgraph` library, `Sheet` (`set`, `set_many`, recalculation, `diff`), `History`, and their tests |
-| Nikay — Sheet and app | `Coord`, `Json`, Dream server, React frontend, repo and test setup |
+| Nikay — Server and app | `Coord`, `Json`, Dream server (including undo/redo endpoints), React frontend, repo and test setup |
 
 Everyone writes tests for their own modules.
 
