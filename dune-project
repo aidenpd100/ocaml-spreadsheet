@@ -6,6 +6,7 @@
 
 (package
  (name camlsheet)
+  (allow_empty)
  (synopsis "A web spreadsheet with incremental recalculation, written in OCaml")
  (depends
   (ocaml (>= 5.0))

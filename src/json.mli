@@ -4,13 +4,13 @@
 
 (** Converts a single cell into JSON containing its coordinate,
     raw input, displayed value, and value type. *)
-val cell_to_json : Coord.t -> Sheet.cell -> Yojson.Safe.t
+val cell_to_json : Coord.t -> Camlsheet.Sheet.cell -> Yojson.Safe.t
 
 (** Converts all affected cells into JSON after a spreadsheet update.
     Uses the updated sheet and a list of affected coordinates to
     retrieve their current values. Includes cleared cells so the
     frontend knows which cells to remove. *)
-val changed_to_json : Sheet.t -> Coord.t list -> Yojson.Safe.t
+val changed_to_json : Camlsheet.Sheet.t -> Coord.t list -> Yojson.Safe.t
 
 (** Extracts the raw input from a JSON object.
     Returns [Ok raw] if the input is valid, or [Error message]

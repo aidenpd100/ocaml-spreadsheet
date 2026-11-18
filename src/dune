@@ -7,10 +7,10 @@
   (name json)
   (modules json)
   (modules_without_implementation json)
-  (libraries coord yojson))
+  (libraries coord camlsheet yojson))
 
 (library
   (name persistence)
   (modules persistence)
   (modules_without_implementation persistence)
-  (libraries coord camlsheetyojson))
+  (libraries coord camlsheet yojson))
