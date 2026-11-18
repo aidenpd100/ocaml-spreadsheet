@@ -33,5 +33,3 @@ module Map : Map.S with type key = t
 
 (** Sets containing unique coordinates. *)
 module Set : Set.S with type elt = t
-
-(*POTENTIALLY NEED THE THE FUNCTIONS SET FOR COL AND ROW. WILL CHECK LATER*)
