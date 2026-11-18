@@ -1,0 +1,7 @@
+_build/
+_opam/
+_coverage/
+*.install
+node_modules/
+frontend/dist/
+.DS_Store
