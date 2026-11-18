@@ -1,0 +1,6 @@
+(library
+ (name depgraph)
+ (libraries core)
+ (preprocess (pps ppx_jane))
+ ; Design phase: interface only. Delete once depgraph.ml exists.
+ (modules_without_implementation depgraph))
