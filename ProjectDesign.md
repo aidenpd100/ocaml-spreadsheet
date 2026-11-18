@@ -241,7 +241,7 @@ dune-project            (with opam package stanza; generates camlsheet.opam)
 src/
   depgraph/             dune library `depgraph`  — the general library
     depgraph.mli
-  sheet/                dune library `sheet`     — depends on depgraph
+  camlsheet/                dune library `sheet`     — depends on depgraph
     coord.mli
     formula.mli
     eval.mli

@@ -1,0 +1,13 @@
+# OCaml / dune build output
+_build/
+_opam/
+_coverage/
+*.install
+bisect*.coverage
+
+# Frontend
+node_modules/
+dist/
+
+# macOS
+.DS_Store
