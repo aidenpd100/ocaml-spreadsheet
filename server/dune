@@ -1,0 +1,8 @@
+(executable
+ (name main)
+ (libraries
+  dream
+  camlsheet
+  coord
+  json
+  persistence))
