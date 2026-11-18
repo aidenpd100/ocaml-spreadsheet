@@ -1,0 +1,9 @@
+(executable
+ (name main)
+ (libraries
+  dream
+  camlsheet
+  coord
+  json
+  persistence)
+ (modules_without_implementation routes state))

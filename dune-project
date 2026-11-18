@@ -1,4 +1,4 @@
-(lang dune 3.0)
+(lang dune 3.24)
 (using menhir 2.1)
 
 (name camlsheet)
@@ -6,6 +6,7 @@
 
 (package
  (name camlsheet)
+  (allow_empty)
  (synopsis "A web spreadsheet with incremental recalculation, written in OCaml")
  (depends
   (ocaml (>= 5.0))

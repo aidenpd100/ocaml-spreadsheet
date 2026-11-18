@@ -5,3 +5,4 @@ _coverage/
 node_modules/
 frontend/dist/
 .DS_Store
+dist/

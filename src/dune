@@ -1,0 +1,16 @@
+(library
+  (name coord)
+  (modules coord)
+  (modules_without_implementation coord))
+
+(library
+  (name json)
+  (modules json)
+  (modules_without_implementation json)
+  (libraries coord camlsheet yojson))
+
+(library
+  (name persistence)
+  (modules persistence)
+  (modules_without_implementation persistence)
+  (libraries coord camlsheet yojson))
