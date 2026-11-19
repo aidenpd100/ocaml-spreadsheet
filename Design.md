@@ -11,8 +11,7 @@ Camlsheet is a web-based spreadsheet. Users type numbers, text, or formulas
 (`=B1*2`, `=SUM(A1:A10)`) into a grid in the browser, and the sheet keeps every
 formula's value up to date as the cells it depends on change.
 
-All of the spreadsheet logic lives in OCaml on a Dream server. The React
-frontend only displays cells and sends edits; it does no parsing or calculation.
+All of the spreadsheet logic lives in OCaml on a Dream server. The frontend is built using ReScript and React to display the spreadsheet and handle user interactions. It communicates with the backend through HTTP requests and JSON, while formula parsing, evaluation, and recalculation happen on the server.
 
 The interesting parts of the project are:
 
@@ -38,24 +37,9 @@ The interesting parts of the project are:
 
 ### 2.1 The page
 
-There is a single page. It has a formula bar on top and a grid underneath.
-The grid shows columns A–Z and rows 1–100. (The backend has no size limit; the
-UI just shows a fixed window to start.)
+Camlsheet has a single-page interface with a formula bar at the top and a spreadsheet grid underneath. The grid initially displays columns A–Z and rows 1–100, but users can adjust the number of visible rows and columns through the interface. The backend uses sparse storage, so it is not limited to the dimensions displayed in the frontend.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Camlsheet                                                │
-├──────┬───────────────────────────────────────────────────┤
-│  A1  │                                                   │  ← formula bar: selected cell + raw input
-├──────┴──┬─────────┬─────────┬─────────┬─────────┬────────┤
-│         │    A    │    B    │    C    │    D    │   …    │
-├─────────┼─────────┼─────────┼─────────┼─────────┼────────┤
-│    1    │[       ]│         │         │         │        │  ← [ ] = selected cell
-│    2    │         │         │         │         │        │
-│    3    │         │         │         │         │        │
-│    …    │         │         │         │         │        │
-└─────────┴─────────┴─────────┴─────────┴─────────┴────────┘
-```
+[View Camlsheet Frontend Mockups](CamlSheet_mocks.pdf)
 
 **Controls**
 
@@ -235,27 +219,28 @@ returns `{"changed": []}`.
 ## 3. Architecture
 
 ```
-┌──────────────┐   JSON over HTTP   ┌─────────────────────────────────────────┐
-│ React (Vite) │ ─────────────────► │ server/  (Dream)                        │
-│  grid,       │ ◄───────────────── │   holds one `Sheet.t History.t ref`     │
-│  formula bar │                    │   decodes requests, encodes responses   │
-└──────────────┘                    └──────────────────┬──────────────────────┘
-                                                       │ calls (pure)
-                                    ┌──────────────────▼────────────────────────────────┐
-                                    │ src/camlsheet  (spreadsheet library)              │
-                                    │   Coord · Formula · Eval · Sheet · History · Json │
-                                    └──────────────────┬────────────────────────────────┘
-                                                       │ instantiates
-                                    ┌──────────────────▼──────────────────────┐
-                                    │ src/depgraph  (general library)         │
-                                    │   Depgraph.Make (Key) — no spreadsheet  │
-                                    │   knowledge at all                      │
-                                    └─────────────────────────────────────────┘
+┌────────────────────┐   JSON over HTTP   ┌─────────────────────────────────────────┐
+│ ReScript + React   │ ─────────────────► │ server/ (Dream)                         │
+│  grid,             │ ◄───────────────── │   holds one `Sheet.t History.t ref`     │
+│  formula bar       │                    │   decodes requests, encodes responses   │
+└────────────────────┘                    │   handles save/load file operations     │
+                                          └──────────────────┬──────────────────────┘
+                                                             │ calls (pure)
+                                    ┌────────────────────────▼────────────────────────┐
+                                    │ src/camlsheet (spreadsheet library)             │
+                                    │   Coord · Formula · Eval · Sheet · History · Json│
+                                    │   Persistence                                   │
+                                    └────────────────────────┬────────────────────────┘
+                                                             │ instantiates
+                                    ┌────────────────────────▼────────────────────────┐
+                                    │ src/depgraph (general library)                  │
+                                    │   Depgraph.Make (Key) — no spreadsheet          │
+                                    │   knowledge at all                              │
+                                    └─────────────────────────────────────────────────┘
+
 ```
 
-**Rule:** everything under `src/` is pure — no IO, no mutation. The only 
-mutable state in the project is the single Sheet.t History.t ref in the 
-server (the current sheet plus its undo history).
+**Rule:** The core spreadsheet modules remain pure, with no I/O or mutation. The Dream server manages the current sheet and its undo/redo history using a single `Sheet.t History.t ref`, while the `Persistence` module handles file operations for saving and loading spreadsheets.
 
 ### Repository layout
 
@@ -272,12 +257,19 @@ src/
     sheet.mli
     history.mli
     json.mli
+    persistence.mli
+    ast.mli
+    lexer.mll
+    parser.mly
 server/                 dune executable           — depends on camlsheet, dream
   main.ml
+  routes.mli
+  state.mli
 test/                   OUnit2 + QCheck tests, one file per module
 demo/                   one working demo per non-standard library
   dream/  yojson/  qcheck/  bisect_ppx/
-frontend/               React + Vite (not counted as project code)
+frontend/               React + ReScript
+CamlSheet_mocks.pdf
 ```
 
 (The library is named camlsheet rather than sheet because dune does not allow a library to contain a module with the library’s own name.)
@@ -291,17 +283,22 @@ describes what each module does and the key types.
 
 ### 4.1 `Coord` — cell coordinates
 
-```ocaml
-type t = { row : int; col : int }   (* 0-indexed: A1 = {row=0; col=0} *)
-[@@deriving compare, sexp, yojson]
+The `Coord` module represents spreadsheet coordinates using an abstract type `t`, preventing invalid coordinates from being created directly. Coordinates are zero-indexed internally, with A1 corresponding to row 0 and column 0.
 
-val of_a1 : string -> t option      (* "B12" -> Some {row=11; col=1}; "1B" -> None *)
-val to_a1 : t -> string             (* {row=11; col=1} -> "B12" *)
-val range : t -> t -> t list        (* all coords in the rectangle, either corner order *)
+```ocaml
+type t [@@deriving sexp]
+
+include Comparable.S with type t := t
+
+val create_coord : int -> int -> t option
+val get_row : t -> int
+val get_col : t -> int
+val of_a1 : string -> t option
+val to_a1 : t -> string
+val range : t -> t -> t list
 ```
 
-Column letters use bijective base 26: A–Z, then AA, AB, … AZ, BA, … .
-`of_a1` is case-insensitive. `Coord` also provides `Map` and `Set` modules.
+`create_coord` validates row and column indices, returning `None` if either is negative. Column letters use bijective base 26: A–Z, then AA, AB, … AZ, BA, … . `of_a1` is case-insensitive, and `range` returns all coordinates within a rectangle regardless of the order of its corners. The module also provides comparison operations and `Map` and `Set` through Core's `Comparable.S`.
 
 ### 4.2 `Formula` — lexer, parser, AST
 
@@ -519,6 +516,19 @@ val raw_of_json    : Yojson.Safe.t -> (string, string) result   (* {"raw": "..."
 Bad coordinates or bad JSON → 400 with `{"error": "..."}`.
 
 ---
+### 4.9 `Persistence` — saving and loading spreadsheets
+
+The `Persistence` module allows users to save and load spreadsheets across sessions. It stores cell coordinates and raw inputs in JSON files rather than calculated values, which are recomputed when the spreadsheet is loaded.
+
+```ocaml
+val sheet_to_json : Camlsheet.Sheet.t -> Yojson.Safe.t
+val json_to_sheet : Yojson.Safe.t -> (Camlsheet.Sheet.t, string) result
+val save_sheet : string -> Camlsheet.Sheet.t -> (unit, string) result
+val load_sheet : string -> (Camlsheet.Sheet.t, string) result
+```
+
+`sheet_to_json` and `json_to_sheet` handle conversion between spreadsheets and JSON, while `save_sheet` and `load_sheet` manage file operations. Both saving and loading return results that allow the application to handle errors without crashing.
+
 
 ## 5. Libraries
 
@@ -531,10 +541,7 @@ Bad coordinates or bad JSON → 400 with `{"error": "..."}`.
 | `qcheck-core`, `qcheck-ounit` | Property-based tests | `demo/qcheck/` — one property run under OUnit |
 | `bisect_ppx` | Coverage reports | `demo/bisect_ppx/` — coverage report on a toy module |
 
-**Frontend (not counted as project code):** React + Vite, using `fetch` to call
-the API. It contains no spreadsheet logic.
-
-Each demo has been built and run on all three team members' machines.
+**Frontend**: ReScript and React will be used to build the spreadsheet interface, including the grid, formula bar, and user controls. The frontend will communicate with the Dream server through HTTP requests using JSON. All spreadsheet calculations will remain in OCaml on the backend.
 
 ---
 
@@ -553,6 +560,8 @@ Each demo has been built and run on all three team members' machines.
     refer to; `set_many`; `of_raw`/`to_raw`; `diff`.
   - `History`: undo/redo order, redo cleared by a new push, the limit, undo and
     redo on an empty history.
+  - `Json`: Correct JSON formatting for cells and affected cell updates, including cleared cells; extracting raw input from valid requests; handling missing or invalid `raw` fields.
+  - `Persistence`: Converting sheets to JSON and reconstructing them; saving and loading spreadsheet files; handling malformed JSON, invalid data, and file read/write errors.
 - **QCheck properties:**
   - `Coord.of_a1 (Coord.to_a1 c) = Some c`
   - `Formula.parse (Formula.to_string e) = Ok e`
@@ -564,7 +573,9 @@ Each demo has been built and run on all three team members' machines.
   - `Sheet.of_raw (Sheet.to_raw s)` has the same values as `s`.
   - `undo (push h x)` gives back `h`'s current state.
   - Evaluating a sheet with no formulas gives back the literal values.
+  - `Persistence.json_to_sheet (Persistence.sheet_to_json s)` reconstructs a sheet with the same raw inputs and calculated values as `s`.
 - **Coverage:** `bisect_ppx`, run with `dune test --instrument-with bisect_ppx`.
+
 
 ---
 
@@ -576,7 +587,7 @@ Each demo has been built and run on all three team members' machines.
 |---|---|
 | Max — Formulas | `Formula` (lexer, parser, `refs`, `to_string`), `Eval` (values, functions) |
 | Aiden — Engine | `Depgraph` library, `Sheet` (`set`, `set_many`, recalculation, `diff`), `History`, and their tests |
-| Nikay — Server and app | `Coord`, `Json`, Dream server (including undo/redo endpoints), React frontend, repo and test setup |
+| Nikay — Server and app | `Coord`, `Json`, `Persistence`, Dream server (including undo/redo and save/load endpoints), ReScript + React frontend integration|
 
 Everyone writes tests for their own modules.
 
@@ -584,11 +595,11 @@ Everyone writes tests for their own modules.
 
 | Dates | Formulas | Engine | Server and app |
 |---|---|---|---|
-| **Nov 7–18** | `formula.mli`, `eval.mli` | `depgraph.mli`, `sheet.mli`, `history.mli` | Repo, `dune-project`, demos, `coord.mli`, `json.mli`, mockups |
+| **Nov 7–18** | `formula.mli`, `eval.mli` | `depgraph.mli`, `sheet.mli`, `history.mli` | Repo, `dune-project`, demos, `coord.mli`, `json.mli`, `persistence.mli`, server interfaces, and mockups |
 | **Nov 18** | **Design proposal submitted** | | |
-| Nov 19–23 | Lexer; parser for numbers, refs, arithmetic | `Depgraph`: `set_deps`, `remove`, `deps`, `dependents`; forward/reverse invariant property test | `Coord` + tests; Dream server returning a hard-coded sheet as JSON; React grid that displays it |
-| Nov 24–30 | Ranges and function calls in the parser; `Eval` with errors and the function registry | `recalc_plan` (DFS + Kahn) and `recalc_plan_many`; cycle tests; `History` | `Json`; GET and PUT endpoints; React editing and PUT requests |
-| Dec 1–6 | `to_string` + round-trip property test | `Sheet.set` / `set_many` (against stubs, then the real `Formula`/`Eval`); `of_raw`/`to_raw`; incremental-vs-full property test | Wire `Sheet` into the server; undo/redo endpoints and buttons; coverage report; `Readme.md` |
+| Nov 19–23 | Lexer; parser for numbers, refs, arithmetic | `Depgraph`: `set_deps`, `remove`, `deps`, `dependents`; forward/reverse invariant property test | `Coord` + tests; Dream server returning a hard-coded sheet as JSON; React+ReScript grid that displays it |
+| Nov 24–30 | Ranges and function calls in the parser; `Eval` with errors and the function registry | `recalc_plan` (DFS + Kahn) and `recalc_plan_many`; cycle tests; `History` | `Json`; GET and PUT endpoints; ReScript + React editing editing and PUT requests |
+| Dec 1–6 | `to_string` + round-trip property test | `Sheet.set` / `set_many` (against stubs, then the real `Formula`/`Eval`); `of_raw`/`to_raw`; incremental-vs-full property test | Wire `Sheet` into the server; undo/redo endpoints and buttons; coverage report; Persistence implementation; save/load functionality; `Readme.md` |
 | **~Dec 7** | **Code checkpoint** (date to confirm): every §2 scenario works end to end | | |
 | Dec 8–17 | Advisor feedback; edge-case tests; an extension from §8 if time allows | `diff`; edge-case tests; integration help | Advisor feedback; UI polish; an extension from §8 if time allows |
 | **Dec 18–20** | **Demo** | | |
@@ -599,7 +610,6 @@ Everyone writes tests for their own modules.
 
 Not part of the core plan. We'll pick from these with our advisor once the core works.
 
-- **Save/load.** Write the sheet's raw inputs to a JSON file and rebuild it on load.
 - **More functions.** `IF`, comparisons, `ROUND`, string concatenation.
 - **Copy/paste with relative references.** Pasting `=A1` one row down gives `=A2`.
 - **Scrolling past row 100.** Fetch cells for whatever window is visible.
