@@ -9,11 +9,11 @@
 
 (** One stored cell *)
 type cell = {
-  raw : string;              (** exactly what the user typed *)
-  content : Formula.content; (** [raw], classified and parsed *)
-  value : Eval.value;        (** current computed value *)
+  raw : string;                         (** exactly what the user typed *)
+  parsed : (Ast.expr, string) Result.t; (** [raw], parsed; [Error] means the cell shows #PARSE *)
+  value : Evaluator.value;              (** current computed value *)
 }
-[@@deriving compare, sexp]
+[@@deriving equal, sexp]
 
 (** The dependency graph used by sheets: [Depgraph] instantiated with
     coordinates as keys. *)
@@ -28,7 +28,7 @@ val get : t -> Coord.t -> cell option
 
 (** The value at a coordinate ([VEmpty] if the cell is empty). This is the
     [lookup] function handed to [Eval]. *)
-val value : t -> Coord.t -> Eval.value
+val value : t -> Coord.t -> Evaluator.value
 
 (** All non-empty cells in the rectangle with the given corners, in row-major
     order. Used to load the visible part of the grid. *)
@@ -45,7 +45,7 @@ val graph : t -> Graph.t
     changed (always including [c]).
 
     Steps:
-    1. Classify [raw]. Empty input removes [c] from the cell map, but [c]
+    1. Parse [raw] with [Formula.parse_cell]. Empty input removes [c] from the cell map, but [c]
        stays in the graph as a key, so its dependents still recalculate and
        see [VEmpty].
     2. Record [c]'s new dependencies with [Graph.set_deps] (none for numbers/text, 

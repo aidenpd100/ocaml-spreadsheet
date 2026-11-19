@@ -1,7 +1,12 @@
+open Core
 
 (** Represents a cell's location in the spreadsheet using zero-based
     row and column indices. A1 corresponds to (0, 0). *)
-type t
+type t [@@deriving sexp]
+
+(** [compare] (by row first, then column), [equal], and
+    [Coord.Map] / [Coord.Set] for using coordinates as keys. *)
+include Comparable.S with type t := t
 
 (** Creates a coordinate from a row and column.
     Returns [None] if either index is negative. *)
@@ -23,13 +28,3 @@ val to_a1 : t -> string
 (** Returns all coordinates within the rectangle defined by two
     corners, including both endpoints, regardless of their order. *)
 val range : t -> t -> t list
-
-(** Compares two coordinates by row first, then column.
-    Returns a negative integer, zero, or a positive integer. *)
-val compare : t -> t -> int
-
-(** Maps that use coordinates as keys. *)
-module Map : Map.S with type key = t
-
-(** Sets containing unique coordinates. *)
-module Set : Set.S with type elt = t

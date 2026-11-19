@@ -1,7 +1,7 @@
 # Camlsheet — Design Proposal
 
-**Group members:** _Name 1_, _Name 2_, _Name 3_
-**Project name:** Camlsheet (working title)
+**Group members:** Aidan, Nikay Jones, Max Voeltner
+**Project name:** Camlsheet
 
 ---
 
@@ -20,8 +20,8 @@ The interesting parts of the project are:
    not a 2D array. Only cells that contain something are stored, so the sheet is
    effectively unbounded and memory use depends on how many cells are filled,
    not on the grid size.
-2. **A formula language.** A lexer and recursive-descent parser turn formula
-   strings into an AST, which a pure evaluator computes.
+2. **A formula language.** An ocamllex lexer and a Menhir parser turn formula
+   text into an AST, which a pure evaluator computes.
 3. **A dependency graph.** When a cell changes, we work out exactly which cells
    depend on it (directly or indirectly), recalculate only those, in an order
    that guarantees every cell's inputs are computed first, and detect circular
@@ -30,7 +30,8 @@ The interesting parts of the project are:
    `Depgraph.Make (Key)`, that knows nothing about spreadsheets. The spreadsheet
    uses it with `Coord` as the key, but it could equally drive a build system or
    task scheduler.
-
+5. **Cheap undo.** Because sheets are persistent values, undo/redo is a history
+   of old sheets that share all their unchanged cells.
 ---
 
 ## 2. Mock use
@@ -38,28 +39,9 @@ The interesting parts of the project are:
 ### 2.1 The page
 
 There is a single page. It has a formula bar on top and a grid underneath.
-The grid shows columns A–Z and rows 1–100. (The backend has no size limit; the
-UI just shows a fixed window to start.)
-
-```
-┌──────────────────────────────────────────────────────────┐
-│ Camlsheet                                                │
-├──────┬───────────────────────────────────────────────────┤
-│  A1  │                                                   │  ← formula bar: selected cell + raw input
-├──────┴──┬─────────┬─────────┬─────────┬─────────┬────────┤
-│         │    A    │    B    │    C    │    D    │   …    │
-├─────────┼─────────┼─────────┼─────────┼─────────┼────────┤
-│    1    │[       ]│         │         │         │        │  ← [ ] = selected cell
-│    2    │         │         │         │         │        │
-│    3    │         │         │         │         │        │
-│    …    │         │         │         │         │        │
-└─────────┴─────────┴─────────┴─────────┴─────────┴────────┘
-```
+The grid shows columns and rows. See attached for mock.
 
 **Controls**
-
-| Action | Effect |
-|---|---|
 | Click a cell / arrow keys | Select it. The formula bar shows its **raw input** (e.g. `=B1*2`), the grid shows its **value** (e.g. `10`). |
 | Start typing / double-click / Enter | Start editing the selected cell. |
 | Enter (while editing) | Commit the edit, then move selection down one row. |
@@ -69,6 +51,9 @@ UI just shows a fixed window to start.)
 
 Every commit sends one request to the server. The server replies with **every
 cell whose value changed**, and the UI updates exactly those cells.
+
+| Undo / Redo buttons, Ctrl+Z / Ctrl+Y | Undo or redo the last edit (greyed out when there is nothing to undo/redo). |
+| Save / Load buttons | Download the sheet as a JSON file / upload one to replace the sheet. |
 
 ### 2.2 Entering numbers and text
 
@@ -83,11 +68,12 @@ The user selects B1, types `5`, presses Enter, then types `Price` into A1.
 │    2    │         │         │         │
 ```
 
-Input classification (done in OCaml):
-- Empty or whitespace only → the cell is removed from the sheet.
+How a cell's text is interpreted (done in OCaml by `Formula.parse_cell`, after
+removing surrounding whitespace):
+- Empty → the cell is removed from the sheet.
 - Starts with `=` → formula.
-- Parses as a number (`5`, `-3.2`, `1e3`) → number.
-- Anything else → text.
+- A valid number (`5`, `-3.2`, `1.`, `.5`) → number.
+- Anything else → text (e.g. `Price`, `----10`).
 
 ### 2.3 Entering a formula
 
@@ -149,8 +135,10 @@ Only B1, C1 and D1 are recalculated. Cells that don't depend on B1 are not touch
 │    5    │ Total   │[     10]│   empty and text cells inside a range are skipped
 ```
 
-Supported functions: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`. Function names and
-cell references are case-insensitive (`=sum(b1:b4)` works).
+Supported functions: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`. Each takes any number
+of arguments, mixing ranges, cells and numbers: `=SUM(A1:A3, C1:C3, 10)`.
+Ranges are rectangles given by two opposite corners (`A1:C3`, or `C3:A1`).
+Function names and cell references are case-insensitive (`=sum(b1:b4)` works).
 
 ### 2.6 Errors
 
@@ -160,6 +148,8 @@ Errors are values, not crashes. A cell with an error shows the error code in red
 |---|---|---|
 | `=1/0` | `#DIV/0` | Division by zero |
 | `=B1+` | `#PARSE` | The formula doesn't parse |
+| `=A1:A3` | `#PARSE` | A range is only allowed inside a function call |
+| `=A0` | `#PARSE` | Not a valid cell reference (rows start at 1) |
 | `=FOO(1)` | `#NAME` | Unknown function |
 | `=A1+1` where A1 is `Price` | `#VALUE` | Arithmetic on text |
 | `=AVG(E1:E5)` where E1:E5 are empty | `#DIV/0` | Average of nothing |
@@ -193,7 +183,33 @@ The user selects B2 and presses Delete. B2 is removed from the sheet. Cells that
 referred to it treat it as empty: `0` in arithmetic, skipped in ranges. B5
 (`=SUM(B1:B4)`) updates to `7`.
 
-### 2.9 Loading the page
+### 2.9 Undo and redo
+
+After clearing B2, the user clicks **Undo**. B2 shows `3` again and B5 goes
+back to `10`. **Redo** clears B2 again.
+
+```
+POST /api/undo
+
+200 OK
+{"changed": [
+  {"coord": "B2", "raw": "3",           "display": "3",  "kind": "number"},
+  {"coord": "B5", "raw": "=SUM(B1:B4)", "display": "10", "kind": "number"}
+]}
+```
+
+The UI asks `GET /api/history` after each edit to know whether the Undo and Redo
+buttons should be enabled. Undoing with nothing to undo returns an error and the
+sheet is unchanged.
+
+### 2.10 Saving and loading
+
+**Save** downloads the sheet as a JSON file containing every cell's raw input.
+**Load** uploads such a file and replaces the current sheet; every value is
+recalculated from the raw inputs. An invalid file is rejected with an error
+message and the current sheet is kept.
+
+### 2.11 Loading the page
 
 When the page loads, the frontend asks for all cells in the visible window:
 
@@ -204,9 +220,6 @@ GET /api/cells?from=A1&to=Z100
 {"cells": [ {"coord": "A1", "raw": "Price", "display": "Price", "kind": "text"}, … ]}
 ```
 
-The sheet lives in server memory for the session. (Saving to a file is a
-possible extension; see §8.)
-
 ---
 
 ## 3. Architecture
@@ -214,24 +227,29 @@ possible extension; see §8.)
 ```
 ┌──────────────┐   JSON over HTTP   ┌─────────────────────────────────────────┐
 │ React (Vite) │ ─────────────────► │ server/  (Dream)                        │
-│  grid,       │ ◄───────────────── │   holds one `Sheet.t ref`               │
-│  formula bar │                    │   decodes requests, encodes responses   │
-└──────────────┘                    └──────────────────┬──────────────────────┘
-                                                       │ calls (pure)
+│  grid,       │ ◄───────────────── │   holds one `Sheet.t History.t ref`     │
+│  formula bar,│                    │   routes requests, encodes responses    │
+│  toolbar     │                    └──────────────────┬──────────────────────┘
+└──────────────┘                                       │ calls (pure)
                                     ┌──────────────────▼──────────────────────┐
-                                    │ src/sheet  (spreadsheet library)        │
-                                    │   Coord · Formula · Eval · Sheet · Json │
+                                    │ src/json, src/persistence               │
+                                    │   wire format, save/load files          │
                                     └──────────────────┬──────────────────────┘
-                                                       │ instantiates
                                     ┌──────────────────▼──────────────────────┐
-                                    │ src/depgraph  (general library)         │
-                                    │   Depgraph.Make (Key) — no spreadsheet  │
-                                    │   knowledge at all                      │
-                                    └─────────────────────────────────────────┘
+                                    │ src/camlsheet  (spreadsheet library)    │
+                                    │   Lexer · Parser · Ast · Formula ·      │
+                                    │   Evaluator · Sheet · History           │
+                                    └─────────┬──────────────────┬────────────┘
+                                              │                  │ instantiates
+                                    ┌─────────▼──────┐  ┌────────▼────────────┐
+                                    │ src/coord      │  │ src/depgraph        │
+                                    │  coordinates,  │  │  Depgraph.Make(Key) │
+                                    │  A1 notation   │  │  general library    │
+                                    └────────────────┘  └─────────────────────┘
 ```
 
 **Rule:** everything under `src/` is pure — no IO, no mutation. The only
-mutable state in the project is the single `Sheet.t ref` in the server.
+mutable state in the project is the single history reference in the server.
 
 ### Repository layout
 
@@ -239,22 +257,30 @@ mutable state in the project is the single `Sheet.t ref` in the server.
 Design.md
 dune-project            (with opam package stanza; generates camlsheet.opam)
 src/
-  depgraph/             dune library `depgraph`  — the general library
+  dune                  libraries `coord`, `json`, `persistence`
+  coord.mli/.ml
+  json.mli
+  persistence.mli
+  depgraph/             dune library `depgraph` — the general library
     depgraph.mli
-  sheet/                dune library `sheet`     — depends on depgraph
-    coord.mli
-    formula.mli
-    eval.mli
+  camlsheet/            dune library `camlsheet` — depends on coord, depgraph
+    lexer.mll           ocamllex lexer
+    parser.mly          Menhir grammar
+    ast.mli/.ml         the AST, refs, to_string
+    formula.mli/.ml     parse, parse_cell
+    evaluator.mli/.ml   values and evaluation
     sheet.mli
-    json.mli
-server/                 dune executable          — depends on sheet, dream
-  main.ml
+    history.mli
+server/                 dune executable — depends on camlsheet, json, persistence, dream
+  main.ml  routes.mli  state.mli
 test/                   OUnit2 + QCheck tests, one file per module
 demo/                   one working demo per non-standard library
-  dream/  yojson/  qcheck/  bisect_ppx/
+  menhir/  dream/  yojson/  qcheck/
 frontend/               React + Vite (not counted as project code)
 ```
 
+(The library is named `camlsheet`, not `sheet`: a dune library with the same
+name as one of its modules would hide all its other modules.)
 ---
 
 ## 4. Modules
@@ -265,89 +291,154 @@ describes what each module does and the key types.
 ### 4.1 `Coord` — cell coordinates
 
 ```ocaml
-type t = { row : int; col : int }   (* 0-indexed: A1 = {row=0; col=0} *)
-[@@deriving compare, sexp, yojson]
+type t [@@deriving sexp]                (* abstract; 0-indexed: A1 is row 0, col 0 *)
+include Comparable.S with type t := t   (* compare, equal, Coord.Map, Coord.Set *)
 
-val of_a1 : string -> t option      (* "B12" -> Some {row=11; col=1}; "1B" -> None *)
-val to_a1 : t -> string             (* {row=11; col=1} -> "B12" *)
+val create_coord : int -> int -> t option   (* None if either index is negative *)
+val get_row : t -> int
+val get_col : t -> int
+val of_a1 : string -> t option      (* "B12" -> row 11, col 1; "A0", "1B", "A" -> None *)
+val to_a1 : t -> string             (* row 11, col 1 -> "B12" *)
 val range : t -> t -> t list        (* all coords in the rectangle, either corner order *)
 ```
 
 Column letters use bijective base 26: A–Z, then AA, AB, … AZ, BA, … .
-`of_a1` is case-insensitive. `Coord` also provides `Map` and `Set` modules.
+`of_a1` is case-insensitive and rejects anything that isn't letters followed by
+a row number ≥ 1. `Coord` is its own library because `camlsheet`, `json` and
+`persistence` all use it, and they must share one `Coord.t`.
 
-### 4.2 `Formula` — lexer, parser, AST
+### 4.2 Formulas — `Lexer`, `Parser`, `Ast`, `Formula`
+
+A cell's text goes through four modules:
+
+| Module | Written as | Job |
+|---|---|---|
+| `Lexer` | `lexer.mll` (ocamllex) | text → tokens |
+| `Parser` | `parser.mly` (Menhir) | tokens → AST |
+| `Ast` | OCaml | the AST types, `refs`, `to_string` |
+| `Formula` | OCaml | runs lexer + parser, turns their exceptions into `result` |
+
+**`Ast`**
 
 ```ocaml
-type binop = Add | Sub | Mul | Div
+type binop = Add | Sub | Mul | Div [@@deriving equal, sexp]
 
 type expr =
-  | Num of float
-  | Ref of Coord.t
-  | Neg of expr
+  | Num of float                  (* 1, 1., 1.1, .5 *)
+  | Str of string                 (* text cell, e.g. Price; only parse_cell creates these *)
+  | Ref of Coord.t                (* B1 *)
+  | Neg of expr                   (* unary minus: -A1 *)
   | Binop of binop * expr * expr
-  | Call of string * arg list         (* function name stored uppercase *)
+  | Call of string * arg list     (* SUM(A1:A3, 5); name stored uppercase *)
 and arg =
   | Expr of expr
-  | Range of Coord.t * Coord.t        (* ranges only appear as function arguments *)
+  | Range of Coord.t * Coord.t    (* A1:B3; only valid as a function argument *)
+[@@deriving equal, sexp]
 
-type content =
-  | Number of float
-  | Text of string
-  | Formula of expr
-  | Bad_formula of string             (* raw text that failed to parse → #PARSE *)
-
-val classify : string -> content option   (* None for empty input *)
-val parse    : string -> (expr, string) result   (* input without the leading '=' *)
-val refs     : expr -> Coord.t list   (* every cell this formula reads, ranges expanded *)
-val to_string : expr -> string        (* AST back to formula text *)
+val refs : expr -> Coord.t list   (* every cell e reads, ranges expanded, no duplicates *)
+val to_string : expr -> string    (* AST back to formula text, minimal parentheses *)
 ```
 
-**Grammar** (hand-written recursive descent over a token list):
+Every non-empty cell is an `expr`: plain numbers are `Num` and plain text is
+`Str`, so the sheet and evaluator handle all cells the same way. `expr` and
+`arg` are mutually recursive, matching the grammar: a call contains arguments,
+and an argument contains an expression. Making ranges a separate `arg` type
+means a range outside a function call can't even be represented.
+
+`refs` is what connects formulas to the dependency graph: `Sheet` calls it to
+find which cells a formula reads. `to_string` is used for a round-trip property
+test of the parser.
+
+**`Lexer`** (ocamllex). Tokens:
+
+| Token | Matches | Example |
+|---|---|---|
+| `NUMBER of float` | `digit+ ('.' digit*)? \| '.' digit+` | `1`, `1.`, `1.1`, `.5` |
+| `REF of Coord.t` | letters followed by digits, checked by `Coord.of_a1` | `B12`, `aa3` |
+| `FUN_NAME of string` | letters only | `SUM` |
+| `PLUS MINUS STAR SLASH LPAREN RPAREN COMMA COLON` | `+ - * / ( ) , :` | |
+| `EOF` | end of the formula | |
+
+Spaces and tabs are skipped. ocamllex always takes the longest match, so `B12`
+is a reference and `SUM` is a function name. Numbers have no sign; `-5` is
+`MINUS` followed by `NUMBER 5.`. An unexpected character or an invalid
+reference such as `A0` raises `Lexer.Error "At offset N: ..."`.
+
+**`Parser`** (Menhir). The grammar:
 
 ```
-expr   ::= term   (("+" | "-") term)*
-term   ::= factor (("*" | "/") factor)*
-factor ::= NUMBER
+main   ::= expr EOF
+expr   ::= NUMBER
          | REF
-         | "-" factor
          | "(" expr ")"
-         | NAME "(" [ arg ("," arg)* ] ")"
+         | "-" expr                       (%prec UMINUS)
+         | expr ("+" | "-" | "*" | "/") expr
+         | FUN_NAME "(" [ arg ("," arg)* ] ")"
 arg    ::= REF ":" REF
          | expr
+
+%left PLUS MINUS        (lowest)
+%left STAR SLASH
+%nonassoc UMINUS        (highest)
 ```
 
-`*` and `/` bind tighter than `+` and `-`; all four are left-associative. We
-chose a hand-written parser over Menhir so the parser is plain OCaml we can
-test and explain line by line.
+The precedence declarations resolve the grammar's ambiguity: `*` and `/` bind
+tighter than `+` and `-`, all four are left-associative (`8-2-1` is
+`(8-2)-1`), and unary minus binds tightest (`-A1*2` is `(-A1)*2`). The rule
+actions build `Ast` nodes, so the tree is built bottom-up as rules match.
 
-### 4.3 `Eval` — values and evaluation
+**`Formula`**
 
 ```ocaml
-type error = Div_zero | Parse | Name | Value | Cycle
+val parse : string -> (Ast.expr, string) result        (* formula without the '=' *)
+val parse_cell : string -> (Ast.expr, string) result   (* anything typed into a cell *)
+```
+
+`parse` runs `Parser.main Lexer.token` on the text. Menhir and ocamllex report
+errors by raising exceptions; `parse` catches them and returns
+`Error "At offset N: ..."` instead, so nothing outside this module ever sees an
+exception. `parse_cell` handles a cell's full text as in §2.2: `=...` goes to
+`parse`, valid numbers become `Num`, anything else becomes `Str`.
+
+### 4.3 `Evaluator` — values and evaluation
+
+```ocaml
+type error =
+  | Div_zero   (* #DIV/0: 0 in the denominator, or AVG of no numbers *)
+  | Parse      (* #PARSE: cell text can't be parsed; set by Sheet *)
+  | Name       (* #NAME: unknown function name *)
+  | Value      (* #VALUE: wrong kind of value, e.g. arithmetic on text *)
+  | Cycle      (* #CYCLE: part of or depends on a cycle; set by Sheet *)
+
 type value =
   | VNum of float
   | VText of string
   | VEmpty
   | VError of error
 
-val eval : lookup:(Coord.t -> value) -> Formula.expr -> value
-val eval_content : lookup:(Coord.t -> value) -> Formula.content -> value
-val display : value -> string        (* "10", "3.5", "Price", "#DIV/0", "" *)
+val eval : (Coord.t -> value) -> Ast.expr -> value
+val value_to_grid_display : value -> string   (* "10", "2.5", "Price", "", "#DIV/0" *)
 ```
 
-`eval` is pure. It doesn't know about the sheet; it reads other cells only
-through the `lookup` function it is given. This makes it easy to test on its own.
+`eval lookup e` is pure. It doesn't know about the sheet: it reads other cells
+only by calling the `lookup` function it is given, which returns a cell's
+**already computed** value. `Sheet` passes a function that reads its cell map;
+tests can pass a tiny made-up one. This makes the evaluator testable on its own
+and independent of `Sheet`.
 
 **Rules**
 - `VEmpty` counts as `0` in arithmetic.
 - Arithmetic on `VText` gives `VError Value`.
 - If any operand is an error, the result is that error (first one, left to right).
 - Functions are stored in a registry, a `Map` from name to
-  `value list -> value`. A range argument is expanded into its cells' values;
-  inside a range, empty and text cells are skipped. Adding a new function is
-  one new entry in the map.
+  `value list -> value`. Each argument becomes a list of values (a range gives
+  the values of all its cells, skipping empty and text cells), the lists are
+  joined, and the function folds over the result. Adding a function is one new
+  entry in the map.
 - Unknown function name → `VError Name`.
+
+`value_to_grid_display` formats values for the frontend (whole numbers without
+a trailing `.`), so the frontend never formats anything itself.
 
 ### 4.4 `Depgraph` — the general library
 
@@ -381,6 +472,9 @@ end
 module Make (Key : sig type t [@@deriving compare, sexp] end) : S with type key = Key.t
 ```
 
+See `src/depgraph/depgraph.mli` for the full signature, including
+`recalc_plan_many` for changing several keys at once.
+
 **Representation.** Two maps, kept in sync:
 - `forward : KeySet.t KeyMap.t` — key → the keys it depends on
 - `reverse : KeySet.t KeyMap.t` — key → the keys that depend on it
@@ -411,72 +505,96 @@ This touches only the affected part of the graph, not the whole sheet.
 
 ```ocaml
 type cell = {
-  raw     : string;            (* exactly what the user typed *)
-  content : Formula.content;
-  value   : Eval.value;
+  raw    : string;                        (* exactly what the user typed *)
+  parsed : (Ast.expr, string) Result.t;   (* Error means the cell shows #PARSE *)
+  value  : Evaluator.value;               (* current computed value *)
 }
 
-module Graph = Depgraph.Make (Coord)
+module Graph : Depgraph.S with type key = Coord.t
 
-type t = { cells : cell Coord.Map.t; graph : Graph.t }
+type t   (* a cell Coord.Map.t plus a Graph.t *)
 
 val empty    : t
 val get      : t -> Coord.t -> cell option
+val value    : t -> Coord.t -> Evaluator.value      (* VEmpty if empty; the lookup for eval *)
 val in_range : t -> Coord.t -> Coord.t -> (Coord.t * cell) list   (* for page load *)
+val to_list  : t -> (Coord.t * cell) list
+val graph    : t -> Graph.t
 
-(* Set a cell's raw input. Returns the new sheet and the coords whose value changed. *)
-val set : t -> Coord.t -> string -> t * Coord.t list
+val set      : t -> Coord.t -> string -> t * Coord.t list
+val set_many : t -> (Coord.t * string) list -> t * Coord.t list   (* load *)
+val of_raw   : (Coord.t * string) list -> t
+val to_raw   : t -> (Coord.t * string) list
+val diff     : t -> t -> Coord.t list    (* cells that differ; used after undo/redo *)
 ```
 
 **What `set sheet c raw` does:**
 
-1. `Formula.classify raw` → content. If `None` (empty input), remove `c` from `cells`.
-2. `Formula.refs` → the list of cells `c` reads (empty for numbers and text).
+1. `Formula.parse_cell raw` → the AST, or an error. Empty input removes `c`
+   from the cell map (it stays in the graph so its dependents see `VEmpty`).
+2. `Ast.refs` → the list of cells `c` reads (none for numbers, text, or a
+   parse error).
 3. `Graph.set_deps graph c refs`.
 4. `Graph.recalc_plan graph c` → `{order; in_cycle}`.
-5. Fold over `order`: evaluate each cell with `Eval.eval_content`, using a
+5. Fold over `order`: evaluate each cell with `Evaluator.eval`, using a
    `lookup` that reads from the cells map **as updated so far**. Because `order`
    is topological, every dependency has already been recomputed when we reach it.
+   A cell whose parse failed gets `VError Parse`.
 6. Set every cell in `in_cycle` to `VError Cycle`.
 7. Return the new sheet and the coords in `order @ in_cycle`.
 
-The old sheet is unchanged (persistent maps), which is what makes undo an easy
-future extension.
+The old sheet is unchanged (persistent maps), which is what makes undo cheap.
 
-### 4.6 `Json` — wire format
+### 4.6 `History` — undo and redo
 
-Converts cells to and from the JSON shown in §2, using `ppx_yojson_conv`. The
-server never builds JSON by hand. `display` and `kind` are computed in OCaml so
-the frontend never formats numbers or decides what is an error.
+A history of `Sheet.t` values: the current sheet, the sheets before it (for
+undo) and after it (for redo). Making an edit pushes the old sheet onto the undo
+stack and clears the redo stack. Old sheets share every unchanged cell with the
+current one, so keeping them costs little memory. After an undo or redo,
+`Sheet.diff` tells the server which cells to send back.
+See `src/camlsheet/history.mli`.
 
-```ocaml
-val cell_to_json   : Coord.t -> Sheet.cell -> Yojson.Safe.t
-val changed_to_json : Sheet.t -> Coord.t list -> Yojson.Safe.t
-val raw_of_json    : Yojson.Safe.t -> (string, string) result   (* {"raw": "..."} *)
-```
+### 4.7 `Json` and `Persistence`
 
-### 4.7 Server endpoints
+`Json` converts cells to and from the JSON shown in §2, using `ppx_yojson_conv`.
+The server never builds JSON by hand. `display` and `kind` are computed in OCaml
+so the frontend never formats numbers or decides what is an error.
+
+`Persistence` saves a sheet as JSON (every cell's raw input, via `Sheet.to_raw`)
+and loads it back (via `Sheet.of_raw`), rejecting invalid files.
+
+See `src/json.mli` and `src/persistence.mli`.
+
+### 4.8 Server endpoints
 
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/api/cells?from=A1&to=Z100` | — | `{"cells": [...]}` all non-empty cells in the rectangle |
 | GET | `/api/cells/:coord` | — | One cell, or 404 if empty |
 | PUT | `/api/cells/:coord` | `{"raw": "..."}` | `{"changed": [...]}`; `"raw": ""` clears the cell |
+| POST | `/api/undo` | — | `{"changed": [...]}`, or an error if there is nothing to undo |
+| POST | `/api/redo` | — | `{"changed": [...]}`, or an error if there is nothing to redo |
+| GET | `/api/history` | — | Whether undo and redo are currently possible |
+| GET | `/api/save` | — | The sheet as a downloadable JSON file |
+| POST | `/api/load` | a saved JSON file | Replaces the sheet; an error if the file is invalid |
 
 Bad coordinates or bad JSON → 400 with `{"error": "..."}`.
-
 ---
 
 ## 5. Libraries
 
 | Library | Use | Demo |
 |---|---|---|
-| `core` | Course standard library: `Map`, `Set`, `List`, deriving | (course standard) |
+| `core`, `ppx_jane` | Course standard library; `[@@deriving equal, compare, sexp]` | (course standard) |
 | `ounit2` | Unit tests | (course standard) |
+| `menhir` | Parser generator for the formula grammar (with ocamllex, part of OCaml) | `demo/menhir/` — Menhir's own `calc` demo; `dune test` checks its output |
 | `dream`, `lwt` | Web server | `demo/dream/` — a route returning JSON |
 | `yojson`, `ppx_yojson_conv` | JSON encoding/decoding | `demo/yojson/` — round-trip a record |
 | `qcheck-core`, `qcheck-ounit` | Property-based tests | `demo/qcheck/` — one property run under OUnit |
-| `bisect_ppx` | Coverage reports | `demo/bisect_ppx/` — coverage report on a toy module |
+
+**Coverage:** we planned to use `bisect_ppx`, but no released version installs
+on OCaml 5.5 (its dependencies require OCaml < 5.4). We are asking the course
+staff which coverage tool to use instead.
 
 **Frontend (not counted as project code):** React + Vite, using `fetch` to call
 the API. It contains no spreadsheet logic.
@@ -488,21 +606,24 @@ Each demo has been built and run on all three team members' machines.
 ## 6. Testing plan
 
 - **OUnit2 unit tests** for every module in `src/`:
-  - `Coord`: A1 conversion edge cases (`Z1`, `AA1`, `ZZ99`, lowercase, invalid input).
-  - `Formula`: precedence (`1+2*3`), associativity (`8-2-1`), unary minus,
-    ranges, nested calls, every kind of malformed input.
-  - `Eval`: each operator and function, empty and text handling, every error
-    code, error propagation.
+  - `Coord`: A1 conversion edge cases (`Z1`, `AA1`, `AZ1`, `BA1`, `ZZ99`,
+    lowercase, `A0`, `1B`, `A`, `""`, `A+5`).
+  - `Lexer`/`Formula`: precedence (`1+2*3`), associativity (`8-2-1`), unary
+    minus, ranges, nested calls, number formats (`1`, `1.`, `.5`), plain text
+    vs numbers in `parse_cell` (`Price`, `----10`), and every kind of malformed
+    input with its error offset.
+  - `Ast`: `refs` with ranges (either corner order) and repeated references.
+  - `Evaluator`: each operator and function, empty and text handling, every
+    error code, error propagation. Uses a small hand-written `lookup`.
   - `Depgraph`: `set_deps` replacing edges, `dependents`, chains, diamonds
     (A→B, A→C, B→D, C→D), self-loops, longer cycles, keys downstream of cycles.
-  - `Sheet`: the scenarios from §2, run as tests.
+  - `Sheet` and `History`: the scenarios from §2, run as tests.
 - **QCheck properties:**
   - `Coord.of_a1 (Coord.to_a1 c) = Some c`
-  - `Formula.parse (Formula.to_string e) = Ok e`
+  - `Formula.parse (Ast.to_string e) = Ok e` for generated ASTs
   - After any sequence of `set_deps`, the forward and reverse maps agree.
   - In `recalc_plan`, every key appears after all of its dependencies that are in the plan.
-  - Evaluating a sheet with no formulas gives back the literal values.
-- **Coverage:** `bisect_ppx`, run with `dune test --instrument-with bisect_ppx`.
+  - Undo after any edit gives back a sheet equal to the one before it.
 
 ---
 
@@ -512,42 +633,31 @@ Each demo has been built and run on all three team members' machines.
 
 | Person | Owns |
 |---|---|
-| _Name 1_ — Formulas | `Formula` (lexer, parser, `refs`, `to_string`), `Eval` (values, functions) |
-| _Name 2_ — Graph | `Depgraph` library and all its tests |
-| _Name 3_ — Sheet and app | `Coord`, `Sheet`, `Json`, Dream server, React frontend, repo and test setup |
+| Max — Formulas and frontend | `Lexer`, `Parser`, `Ast`, `Formula`, `Evaluator`; React frontend |
+| Aidan — Graph | `Depgraph` library and all its tests |
+| Nikay — Sheet and server | `Coord`, `Sheet`, `History`, `Json`, `Persistence`, Dream server, repo and test setup |
 
 Everyone writes tests for their own modules.
 
 **Schedule**
 
-| Dates | Formulas | Graph | Sheet and app |
+| Dates | Formulas and frontend | Graph | Sheet and server |
 |---|---|---|---|
-| **Nov 7–16** | `formula.mli`, `eval.mli` | `depgraph.mli` | Repo, `dune-project`, demos, `coord.mli`, `sheet.mli`, `json.mli`, mockups |
-| **Nov 16** | **Design proposal submitted** | | |
-| Nov 17–23 | Lexer; parser for numbers, refs, arithmetic | `set_deps`, `remove`, `deps`, `dependents`; invariant tests | `Coord` + tests; Dream server returning a hard-coded sheet as JSON; React grid that displays it |
-| Nov 24–30 | Ranges and function calls in the parser; `Eval` with errors and the function registry | `recalc_plan` (DFS + Kahn); cycle tests | `Json`; `Sheet.set` (initially recalculating everything); React editing and PUT requests |
-| Dec 1–6 | `to_string` + round-trip property test | Property tests; help with integration | `Sheet.set` using `recalc_plan`; end-to-end testing; coverage report; `Readme.md` |
-| **~Dec 7** | **Code checkpoint** (date to confirm): every §2 scenario works end to end | | |
-| Dec 8–17 | Fix advisor feedback, more edge-case tests, UI polish, an extension from §8 if time allows | | |
+| **Nov 7–18** | Lexer, Menhir grammar, `Formula` working; `ast.mli`, `evaluator.mli`; Menhir demo | `depgraph.mli` | Repo, `dune-project`, Dream demo, `coord.mli`, `sheet.mli`, `history.mli`, `json.mli`, `persistence.mli` |
+| **Nov 18** | **Design proposal submitted** | | |
+| Nov 19–25 | Parser tests; `Ast.refs`; `Evaluator` for numbers, refs, arithmetic and errors | `set_deps`, `remove`, `deps`, `dependents`; invariant tests | `Coord` (rest of it) + tests; Dream server returning a hard-coded sheet as JSON |
+| Nov 26–Dec 2 | Function registry and ranges in `Evaluator`; React grid displaying cells, editing with PUT requests | `recalc_plan` (DFS + Kahn); cycle tests | `Json`; `Sheet.set` (initially recalculating everything) |
+| Dec 3–7 | `Ast.to_string` + round-trip property test; error styling in the UI | Property tests; help with integration | `Sheet.set` using `recalc_plan`; end-to-end testing; coverage report; `Readme.md` |
+| **~Dec 7** | **Code checkpoint** (date to confirm): every §2.1–2.8 and §2.11 scenario works end to end | | |
+| Dec 8–17 | Undo/redo and save/load buttons in the UI; `IF` (§8) | Help with testing | `History`, `Persistence`, undo/redo and save/load endpoints |
 | **Dec 18–20** | **Demo** | | |
-
 ---
 
-## 8. Possible extensions
+## 8. Planned extensions
 
-Not part of the core plan. We'll pick from these with our advisor once the core works.
-
-- **Undo/redo.** Keep a list of previous `Sheet.t` values. Persistent maps share
-  structure, so each saved version is cheap.
-- **Save/load.** Write the sheet's raw inputs to a JSON file and rebuild it on load.
-- **More functions.** `IF`, comparisons, `ROUND`, string concatenation.
-- **Copy/paste with relative references.** Pasting `=A1` one row down gives `=A2`.
-- **Scrolling past row 100.** Fetch cells for whatever window is visible.
+**Planned: adding arrow visuals to show cycles in real time
 
 ## 9. Known limitations
 
-- Numbers are floats only.
-- A large range like `=SUM(A1:A100000)` adds one graph edge per cell in the range.
-  This is fine at the sizes we expect; storing ranges as single edges would be
-  an optimization for later.
-- One shared sheet per server; no multiple users or multiple sheets.
+- Numbers are floats only, with no exponent notation (`1e3` is text).
+- Formulas can't contain text literals (no `="hello"`).

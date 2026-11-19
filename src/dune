@@ -1,7 +1,8 @@
 (library
   (name coord)
   (modules coord)
-  (modules_without_implementation coord))
+  (libraries core)
+  (preprocess (pps ppx_jane)))
 
 (library
   (name json)
