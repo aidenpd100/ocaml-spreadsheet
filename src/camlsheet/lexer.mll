@@ -26,7 +26,7 @@ rule token = parse
 
 | (letter+ digit+) as r
     (* cell reference ex: B1 *)
-    { match Coord.is_valid_cell_ref r with
+    { match Coord.of_a1 r with
       | Some c -> REF c
       | None ->
         raise (Error (Printf.sprintf "At offset %d: invalid cell reference %s\n"

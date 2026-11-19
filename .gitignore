@@ -1,8 +1,12 @@
+<<<<<<< HEAD
 # OCaml / dune build output
+=======
+>>>>>>> origin/main
 _build/
 _opam/
 _coverage/
 *.install
+<<<<<<< HEAD
 bisect*.coverage
 
 # Frontend
@@ -11,3 +15,9 @@ dist/
 
 # macOS
 .DS_Store
+=======
+node_modules/
+frontend/dist/
+.DS_Store
+dist/
+>>>>>>> origin/main

@@ -1,7 +1,7 @@
 # Camlsheet — Design Proposal
 
-**Group members:** _Name 1_, _Name 2_, _Name 3_
-**Project name:** Camlsheet (working title)
+**Group members:** Aiden Deffner, Max Voeltner, Nikay Jones
+**Project name:** Camlsheet
 
 ---
 
@@ -19,7 +19,8 @@ The interesting parts of the project are:
 1. **Sparse storage.** The sheet is a persistent map from coordinates to cells,
    not a 2D array. Only cells that contain something are stored, so the sheet is
    effectively unbounded and memory use depends on how many cells are filled,
-   not on the grid size.
+   not on the grid size. Every edit produces a new sheet that shares almost all 
+   of its structure with the old one, which makes undo/redo cheap.
 2. **A formula language.** A lexer and recursive-descent parser turn formula
    strings into an AST, which a pure evaluator computes.
 3. **A dependency graph.** When a cell changes, we work out exactly which cells
@@ -66,6 +67,7 @@ UI just shows a fixed window to start.)
 | Tab (while editing) | Commit the edit, then move selection right one column. |
 | Esc (while editing) | Cancel the edit; the cell is unchanged. |
 | Delete / Backspace (not editing) | Clear the cell. |
+| Ctrl/Cmd+Z, Ctrl/Cmd+Shift+Z | Undo / redo (§2.10). |
 
 Every commit sends one request to the server. The server replies with **every
 cell whose value changed**, and the UI updates exactly those cells.
@@ -207,6 +209,27 @@ GET /api/cells?from=A1&to=Z100
 The sheet lives in server memory for the session. (Saving to a file is a
 possible extension; see §8.)
 
+### 2.10 Undo and redo
+ 
+Continuing from §2.8, the user presses Ctrl+Z. B2 comes back as `3` and B5 goes
+back to `10`. Pressing Ctrl+Shift+Z clears B2 again.
+ 
+```
+POST /api/undo
+ 
+200 OK
+{"changed": [
+  {"coord": "B2", "raw": "3",           "display": "3",  "kind": "number"},
+  {"coord": "B5", "raw": "=SUM(B1:B4)", "display": "10", "kind": "number"}
+]}
+```
+ 
+Undo does not replay an inverse edit. The server keeps the previous sheets
+themselves and switches back to one. Because sheets are persistent maps, each
+stored version costs only the cells that changed. Making a new edit after
+undoing clears the redo history, as in any editor. Undo with nothing to undo
+returns `{"changed": []}`.
+
 ---
 
 ## 3. Architecture
@@ -214,14 +237,14 @@ possible extension; see §8.)
 ```
 ┌──────────────┐   JSON over HTTP   ┌─────────────────────────────────────────┐
 │ React (Vite) │ ─────────────────► │ server/  (Dream)                        │
-│  grid,       │ ◄───────────────── │   holds one `Sheet.t ref`               │
+│  grid,       │ ◄───────────────── │   holds one `Sheet.t History.t ref`     │
 │  formula bar │                    │   decodes requests, encodes responses   │
 └──────────────┘                    └──────────────────┬──────────────────────┘
                                                        │ calls (pure)
-                                    ┌──────────────────▼──────────────────────┐
-                                    │ src/sheet  (spreadsheet library)        │
-                                    │   Coord · Formula · Eval · Sheet · Json │
-                                    └──────────────────┬──────────────────────┘
+                                    ┌──────────────────▼────────────────────────────────┐
+                                    │ src/camlsheet  (spreadsheet library)              │
+                                    │   Coord · Formula · Eval · Sheet · History · Json │
+                                    └──────────────────┬────────────────────────────────┘
                                                        │ instantiates
                                     ┌──────────────────▼──────────────────────┐
                                     │ src/depgraph  (general library)         │
@@ -230,8 +253,9 @@ possible extension; see §8.)
                                     └─────────────────────────────────────────┘
 ```
 
-**Rule:** everything under `src/` is pure — no IO, no mutation. The only
-mutable state in the project is the single `Sheet.t ref` in the server.
+**Rule:** everything under `src/` is pure — no IO, no mutation. The only 
+mutable state in the project is the single Sheet.t History.t ref in the 
+server (the current sheet plus its undo history).
 
 ### Repository layout
 
@@ -239,21 +263,24 @@ mutable state in the project is the single `Sheet.t ref` in the server.
 Design.md
 dune-project            (with opam package stanza; generates camlsheet.opam)
 src/
-  depgraph/             dune library `depgraph`  — the general library
+  depgraph/             dune library `depgraph`   — the general library
     depgraph.mli
-  camlsheet/                dune library `sheet`     — depends on depgraph
+  camlsheet/            dune library `camlsheet`  — depends on depgraph
     coord.mli
     formula.mli
     eval.mli
     sheet.mli
+    history.mli
     json.mli
-server/                 dune executable          — depends on sheet, dream
+server/                 dune executable           — depends on camlsheet, dream
   main.ml
 test/                   OUnit2 + QCheck tests, one file per module
 demo/                   one working demo per non-standard library
   dream/  yojson/  qcheck/  bisect_ppx/
 frontend/               React + Vite (not counted as project code)
 ```
+
+(The library is named camlsheet rather than sheet because dune does not allow a library to contain a module with the library’s own name.)
 
 ---
 
@@ -300,6 +327,7 @@ type content =
 val classify : string -> content option   (* None for empty input *)
 val parse    : string -> (expr, string) result   (* input without the leading '=' *)
 val refs     : expr -> Coord.t list   (* every cell this formula reads, ranges expanded *)
+val content_refs : content -> Coord.t list   (* refs of a formula; [] for anything else *)
 val to_string : expr -> string        (* AST back to formula text *)
 ```
 
@@ -350,37 +378,32 @@ through the `lookup` function it is given. This makes it easy to test on its own
 - Unknown function name → `VError Name`.
 
 ### 4.4 `Depgraph` — the general library
-
+ 
+Full signature: `src/depgraph/depgraph.mli`.
+ 
+`Depgraph.Make (Key)` builds a persistent dependency graph over any key type
+that can be compared and printed. It knows nothing about spreadsheets: the
+sheet uses it with `Coord` as the key, but the same module could drive a build
+system (files as keys) or a task scheduler (tasks as keys). Every operation
+returns a new graph and leaves the old one unchanged.
+ 
+**Terminology.** If `a` reads `b`, then `a` *depends on* `b`, `b` is a
+*dependency* of `a`, and `a` is a *dependent* of `b`.
+ 
+**Operations**
+- `set_deps g k ds` makes `k` depend on exactly `ds`, replacing its old
+  dependencies. `remove g k` is `set_deps g k []`.
+- `deps g k` and `dependents g k` look up direct edges in each direction.
+- `recalc_plan g k` says what to recompute after `k` changes, and in what
+  order. `recalc_plan_many g ks` does the same for several changed keys at once
+  (used when loading a sheet).
 ```ocaml
-module type S = sig
-  type key
-  type t
-
-  val empty : t
-
-  (* [set_deps g k ds]: k now depends on exactly the keys ds,
-     replacing whatever k depended on before. *)
-  val set_deps : t -> key -> key list -> t
-
-  (* Remove k's own dependencies. Other keys that depend on k keep their edges. *)
-  val remove : t -> key -> t
-
-  val deps       : t -> key -> key list   (* what k depends on *)
-  val dependents : t -> key -> key list   (* what depends on k (direct only) *)
-
-  type plan = {
-    order    : key list;   (* k and everything that transitively depends on it,
-                              sorted so each key comes after all of its deps *)
-    in_cycle : key list;   (* keys in, or depending on, a cycle; can't be ordered *)
-  }
-
-  (* What to recompute, and in what order, after k changes. *)
-  val recalc_plan : t -> key -> plan
-end
-
-module Make (Key : sig type t [@@deriving compare, sexp] end) : S with type key = Key.t
+type plan = {
+  order    : key list;  (* affected keys, each after all of its dependencies *)
+  in_cycle : key list;  (* keys in, or downstream of, a cycle *)
+}
 ```
-
+ 
 **Representation.** Two maps, kept in sync:
 - `forward : KeySet.t KeyMap.t` — key → the keys it depends on
 - `reverse : KeySet.t KeyMap.t` — key → the keys that depend on it
@@ -389,9 +412,9 @@ Invariant: `b ∈ forward[a]` if and only if `a ∈ reverse[b]`. `set_deps` remo
 `k` from the reverse sets of its old dependencies and adds it to the reverse
 sets of its new ones. We keep the reverse map so `dependents` is a lookup
 instead of a scan over the whole graph.
-
+ 
 **`recalc_plan` algorithm** (in two steps):
-
+ 
 1. **Find affected keys.** Depth-first search from `k` along `reverse` edges,
    collecting every reachable key into a set `R`. These are the only keys that
    can change.
@@ -400,38 +423,52 @@ instead of a scan over the whole graph.
    the in-degree-0 keys. Repeatedly take a key from the queue, append it to
    `order`, and decrement the count of each of its dependents in `R`; when a
    count reaches 0, add that key to the queue.
-
    Any keys left over with a non-zero count are in a cycle or downstream of one,
    because they were waiting on something that never finished. They go in
    `in_cycle`.
 
-This touches only the affected part of the graph, not the whole sheet.
+Every key in `R` ends up in exactly one of `order` or `in_cycle`.
+`recalc_plan_many` is the same algorithm with the DFS started from several keys.
+ 
+**Performance.** `set_deps` costs O(d log n) for a key with d dependencies in a
+graph of n keys. `recalc_plan` costs O((|R| + E_R) log n), where E_R is the
+number of edges inside `R`: it touches only the affected part of the graph, not
+the whole sheet.
 
 ### 4.5 `Sheet` — ties everything together
-
+ 
+Full signature: `src/camlsheet/sheet.mli`.
+ 
+A sheet is a persistent value: a map from coordinates to the non-empty cells,
+plus the dependency graph (`Depgraph.Make (Coord)`) recording which cells read
+which. `type t` is abstract, so nothing outside `Sheet` can let the two get out
+of sync.
+ 
 ```ocaml
 type cell = {
-  raw     : string;            (* exactly what the user typed *)
-  content : Formula.content;
-  value   : Eval.value;
+  raw     : string;           (* exactly what the user typed *)
+  content : Formula.content;  (* raw, classified and parsed *)
+  value   : Eval.value;       (* current computed value *)
 }
-
-module Graph = Depgraph.Make (Coord)
-
-type t = { cells : cell Coord.Map.t; graph : Graph.t }
-
-val empty    : t
-val get      : t -> Coord.t -> cell option
-val in_range : t -> Coord.t -> Coord.t -> (Coord.t * cell) list   (* for page load *)
-
-(* Set a cell's raw input. Returns the new sheet and the coords whose value changed. *)
-val set : t -> Coord.t -> string -> t * Coord.t list
 ```
+ 
+**Operations**
+- Reading: `get`, `value` (the `lookup` function given to `Eval`), and
+  `in_range` for page load.
+- Editing: `set` for one cell, and `set_many` for several at once, which
+  recalculates each affected cell only once.
+- Saving and loading: `to_raw` lists every cell's raw input, and `of_raw`
+  rebuilds a sheet from that list (values are recomputed, never stored).
+- `diff` lists the cells that differ between two sheets. After undo/redo, it
+  tells the frontend what to repaint.
 
 **What `set sheet c raw` does:**
-
-1. `Formula.classify raw` → content. If `None` (empty input), remove `c` from `cells`.
-2. `Formula.refs` → the list of cells `c` reads (empty for numbers and text).
+ 
+1. `Formula.classify raw` → content. If `None` (empty input), remove `c` from
+   `cells`. `c` stays in the graph as a key, so the steps below still run and
+   its dependents recalculate, now seeing it as empty.
+2. `Formula.content_refs` → the list of cells `c` reads (empty for numbers,
+   text, bad formulas, and a cleared cell).
 3. `Graph.set_deps graph c refs`.
 4. `Graph.recalc_plan graph c` → `{order; in_cycle}`.
 5. Fold over `order`: evaluate each cell with `Eval.eval_content`, using a
@@ -440,10 +477,24 @@ val set : t -> Coord.t -> string -> t * Coord.t list
 6. Set every cell in `in_cycle` to `VError Cycle`.
 7. Return the new sheet and the coords in `order @ in_cycle`.
 
-The old sheet is unchanged (persistent maps), which is what makes undo an easy
-future extension.
+The old sheet is unchanged and shares all untouched cells with the new one,
+which is what makes undo cheap (§4.6).
+ 
+### 4.6 `History` — undo/redo
+ 
+Full signature: `src/camlsheet/history.mli`.
+ 
+`'a History.t` is a zipper: the current value, a stack of past values, and a
+stack of undone values. `push` adds a new current value and clears the redo
+stack; `undo` and `redo` move between the stacks and return `None` when there is
+nothing to move. A limit (default 100) drops the oldest past values.
+ 
+It is polymorphic and knows nothing about sheets. The server keeps a
+`Sheet.t History.t` instead of a single `Sheet.t`. Since each past sheet shares
+structure with the next one, 100 stored versions cost about 100 edits' worth of
+memory, not 100 copies of the sheet.
 
-### 4.6 `Json` — wire format
+### 4.7 `Json` — wire format
 
 Converts cells to and from the JSON shown in §2, using `ppx_yojson_conv`. The
 server never builds JSON by hand. `display` and `kind` are computed in OCaml so
@@ -455,13 +506,15 @@ val changed_to_json : Sheet.t -> Coord.t list -> Yojson.Safe.t
 val raw_of_json    : Yojson.Safe.t -> (string, string) result   (* {"raw": "..."} *)
 ```
 
-### 4.7 Server endpoints
+### 4.8 Server endpoints
 
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/api/cells?from=A1&to=Z100` | — | `{"cells": [...]}` all non-empty cells in the rectangle |
 | GET | `/api/cells/:coord` | — | One cell, or 404 if empty |
 | PUT | `/api/cells/:coord` | `{"raw": "..."}` | `{"changed": [...]}`; `"raw": ""` clears the cell |
+| POST | `/api/undo` | — | `{"changed": [...]}`; empty list if there is nothing to undo |
+| POST | `/api/redo` | — | `{"changed": [...]}`; empty list if there is nothing to redo |
 
 Bad coordinates or bad JSON → 400 with `{"error": "..."}`.
 
@@ -494,13 +547,22 @@ Each demo has been built and run on all three team members' machines.
   - `Eval`: each operator and function, empty and text handling, every error
     code, error propagation.
   - `Depgraph`: `set_deps` replacing edges, `dependents`, chains, diamonds
-    (A→B, A→C, B→D, C→D), self-loops, longer cycles, keys downstream of cycles.
-  - `Sheet`: the scenarios from §2, run as tests.
+    (A→B, A→C, B→D, C→D), self-loops, longer cycles, keys downstream of cycles,
+    `recalc_plan_many`.
+  - `Sheet`: the scenarios from §2, run as tests; clearing a cell that others
+    refer to; `set_many`; `of_raw`/`to_raw`; `diff`.
+  - `History`: undo/redo order, redo cleared by a new push, the limit, undo and
+    redo on an empty history.
 - **QCheck properties:**
   - `Coord.of_a1 (Coord.to_a1 c) = Some c`
   - `Formula.parse (Formula.to_string e) = Ok e`
   - After any sequence of `set_deps`, the forward and reverse maps agree.
-  - In `recalc_plan`, every key appears after all of its dependencies that are in the plan.
+  - In `recalc_plan`, every key appears after all of its dependencies that are
+    in the plan, and every affected key is in exactly one of `order`/`in_cycle`.
+  - Incremental recalculation (`set`) gives the same values as rebuilding the
+    whole sheet from scratch with `of_raw`.
+  - `Sheet.of_raw (Sheet.to_raw s)` has the same values as `s`.
+  - `undo (push h x)` gives back `h`'s current state.
   - Evaluating a sheet with no formulas gives back the literal values.
 - **Coverage:** `bisect_ppx`, run with `dune test --instrument-with bisect_ppx`.
 
@@ -512,23 +574,23 @@ Each demo has been built and run on all three team members' machines.
 
 | Person | Owns |
 |---|---|
-| _Name 1_ — Formulas | `Formula` (lexer, parser, `refs`, `to_string`), `Eval` (values, functions) |
-| _Name 2_ — Graph | `Depgraph` library and all its tests |
-| _Name 3_ — Sheet and app | `Coord`, `Sheet`, `Json`, Dream server, React frontend, repo and test setup |
+| Max — Formulas | `Formula` (lexer, parser, `refs`, `to_string`), `Eval` (values, functions) |
+| Aiden — Engine | `Depgraph` library, `Sheet` (`set`, `set_many`, recalculation, `diff`), `History`, and their tests |
+| Nikay — Server and app | `Coord`, `Json`, Dream server (including undo/redo endpoints), React frontend, repo and test setup |
 
 Everyone writes tests for their own modules.
 
 **Schedule**
 
-| Dates | Formulas | Graph | Sheet and app |
+| Dates | Formulas | Engine | Server and app |
 |---|---|---|---|
-| **Nov 7–16** | `formula.mli`, `eval.mli` | `depgraph.mli` | Repo, `dune-project`, demos, `coord.mli`, `sheet.mli`, `json.mli`, mockups |
-| **Nov 16** | **Design proposal submitted** | | |
-| Nov 17–23 | Lexer; parser for numbers, refs, arithmetic | `set_deps`, `remove`, `deps`, `dependents`; invariant tests | `Coord` + tests; Dream server returning a hard-coded sheet as JSON; React grid that displays it |
-| Nov 24–30 | Ranges and function calls in the parser; `Eval` with errors and the function registry | `recalc_plan` (DFS + Kahn); cycle tests | `Json`; `Sheet.set` (initially recalculating everything); React editing and PUT requests |
-| Dec 1–6 | `to_string` + round-trip property test | Property tests; help with integration | `Sheet.set` using `recalc_plan`; end-to-end testing; coverage report; `Readme.md` |
+| **Nov 7–18** | `formula.mli`, `eval.mli` | `depgraph.mli`, `sheet.mli`, `history.mli` | Repo, `dune-project`, demos, `coord.mli`, `json.mli`, mockups |
+| **Nov 18** | **Design proposal submitted** | | |
+| Nov 19–23 | Lexer; parser for numbers, refs, arithmetic | `Depgraph`: `set_deps`, `remove`, `deps`, `dependents`; forward/reverse invariant property test | `Coord` + tests; Dream server returning a hard-coded sheet as JSON; React grid that displays it |
+| Nov 24–30 | Ranges and function calls in the parser; `Eval` with errors and the function registry | `recalc_plan` (DFS + Kahn) and `recalc_plan_many`; cycle tests; `History` | `Json`; GET and PUT endpoints; React editing and PUT requests |
+| Dec 1–6 | `to_string` + round-trip property test | `Sheet.set` / `set_many` (against stubs, then the real `Formula`/`Eval`); `of_raw`/`to_raw`; incremental-vs-full property test | Wire `Sheet` into the server; undo/redo endpoints and buttons; coverage report; `Readme.md` |
 | **~Dec 7** | **Code checkpoint** (date to confirm): every §2 scenario works end to end | | |
-| Dec 8–17 | Fix advisor feedback, more edge-case tests, UI polish, an extension from §8 if time allows | | |
+| Dec 8–17 | Advisor feedback; edge-case tests; an extension from §8 if time allows | `diff`; edge-case tests; integration help | Advisor feedback; UI polish; an extension from §8 if time allows |
 | **Dec 18–20** | **Demo** | | |
 
 ---
@@ -537,8 +599,6 @@ Everyone writes tests for their own modules.
 
 Not part of the core plan. We'll pick from these with our advisor once the core works.
 
-- **Undo/redo.** Keep a list of previous `Sheet.t` values. Persistent maps share
-  structure, so each saved version is cheap.
 - **Save/load.** Write the sheet's raw inputs to a JSON file and rebuild it on load.
 - **More functions.** `IF`, comparisons, `ROUND`, string concatenation.
 - **Copy/paste with relative references.** Pasting `=A1` one row down gives `=A2`.

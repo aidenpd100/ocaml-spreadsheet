@@ -1,9 +1,11 @@
 (library
  (name camlsheet)
- (libraries core)
- (preprocess (pps ppx_jane)))
-
-(ocamllex lexer)
+ (libraries core coord depgraph yojson)
+ (preprocess (pps ppx_jane ppx_yojson_conv))
+ ; Design phase: interfaces only. Teammates add their modules here;
+ ; remove each name once its .ml exists.
+ (modules_without_implementation history sheet))
+ (ocamllex lexer)
 
 (menhir
  (modules parser))

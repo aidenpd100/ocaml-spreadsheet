@@ -1,17 +1,24 @@
 (lang dune 3.24)
-(using menhir 3.0)
+(using menhir 2.1)
 
+(name camlsheet)
 (generate_opam_files true)
 
 (package
- (name ocaml_spreadsheet)
- (allow_empty)
- (synopsis "A web spreadsheet with a dependency-graph recalculation engine")
- (description "Cells hold numbers, text, or formulas. Formulas are parsed with Menhir, and a dependency graph decides what to recalculate when a cell changes.")
+ (name camlsheet)
+  (allow_empty)
+ (synopsis "A web spreadsheet with incremental recalculation, written in OCaml")
  (depends
-  (ocaml (>= 5.5.0))
+  (ocaml (>= 5.0))
+  dune
   core
   ppx_jane
+  yojson
+  ppx_yojson_conv
   menhir
-  ounit2
-  ))
+  dream
+  lwt
+  (ounit2 :with-test)
+  (qcheck-core :with-test)
+  (qcheck-ounit :with-test)
+  (bisect_ppx :with-test)))

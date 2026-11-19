@@ -1,0 +1,17 @@
+(library
+  (name coord)
+  (modules coord)
+  (libraries core)
+  (preprocess (pps ppx_jane)))
+
+(library
+  (name json)
+  (modules json)
+  (modules_without_implementation json)
+  (libraries coord camlsheet yojson))
+
+(library
+  (name persistence)
+  (modules persistence)
+  (modules_without_implementation persistence)
+  (libraries coord camlsheet yojson))
